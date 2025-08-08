@@ -57,8 +57,8 @@ class EvaluationHarness:
         self.scm_memory.set_active_adapter(edge_name)
         
         # 3.4 Optimize task + causal-consistency loss
-        # Placeholder for task loss
         task_loss = ((causal_factors - 1)**2).mean() # Dummy task: push factors to 1
+        d_sep_loss = d_separation_contrastive_loss(causal_factors, noise_factors)
         
         # Causal consistency loss
         parents, a_old, cf_parents = self.crb.sample_cf(edge_name, data.shape[0])
@@ -74,7 +74,7 @@ class EvaluationHarness:
         # EWC-like loss based on CPI
         ewc_loss = cpi * ((target_param - target_param.detach())**2).sum()
         
-        total_loss = task_loss + lambda_consist * consist_loss + lambda_cpi * ewc_loss
+        total_loss = task_loss + d_sep_loss + lambda_consist * consist_loss + lambda_cpi * ewc_loss
         
         self.optimizer.zero_grad()
         total_loss.backward()
