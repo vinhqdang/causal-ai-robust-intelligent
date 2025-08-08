@@ -1,5 +1,6 @@
-from adapters import AdapterConfig
+import adapters
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from adapters import AdapterConfig
 
 class StructuralCausalMemory:
     """
@@ -19,6 +20,9 @@ class StructuralCausalMemory:
         else:
             self.model = AutoModelForCausalLM.from_pretrained(model_name)
         
+        # Initialize adapters for the model
+        adapters.init(self.model)
+        
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.adapters = {}
         print(f"StructuralCausalMemory initialized with model: {model_name}")
@@ -26,14 +30,37 @@ class StructuralCausalMemory:
     def add_adapter_for_edge(self, edge_name: str, config: str = 'lora'):
         """
         Adds a new adapter for a specific causal edge.
+
+        Args:
+            edge_name (str): A unique name for the causal edge (e.g., 'X->Y').
+            config (str): The configuration for the adapter (e.g., 'lora').
         """
-        print(f"Skipping adapter addition for edge: '{edge_name}'")
+        if edge_name in self.model.adapters_config.adapters:
+            print(f"Adapter '{edge_name}' already exists.")
+            return
+
+        # Configure the adapter
+        adapter_config = AdapterConfig.load(config, reduction_factor=16)
+        
+        # Add the adapter to the model
+        self.model.add_adapter(edge_name, config=adapter_config)
+        self.model.train_adapter(edge_name)
+        self.adapters[edge_name] = adapter_config
+        print(f"Added and activated adapter for edge: '{edge_name}'")
 
     def set_active_adapter(self, edge_name: str):
         """
         Sets the active adapter for the model.
+
+        Args:
+            edge_name (str): The name of the edge adapter to activate.
         """
-        print(f"Skipping setting active adapter to: '{edge_name}'")
+        if edge_name not in self.adapters:
+            print(f"Adapter for edge '{edge_name}' not found.")
+            return
+        
+        self.model.set_active_adapters(edge_name)
+        print(f"Active adapter set to: '{edge_name}'")
 
     def forward(self, text: str):
         """
@@ -56,3 +83,24 @@ if __name__ == '__main__':
     # 3. Add adapters for each edge
     for edge in causal_edges:
         scm_memory.add_adapter_for_edge(edge)
+
+    # 4. List the added adapters
+    print("\nAvailable adapters:")
+    print(scm_memory.model.adapters_config.to_dict())
+
+    # 5. Set an active adapter and perform a forward pass
+    active_edge = "treatment->outcome"
+    scm_memory.set_active_adapter(active_edge)
+    
+    # 6. Example forward pass
+    prompt = "Once upon a time"
+    generated_text = scm_memory.forward(prompt)
+    
+    print(f"\nPrompt: '{prompt}'")
+    print(f"Generated text with '{active_edge}' adapter: '{generated_text}'")
+
+    # 7. Switch to another adapter
+    active_edge_2 = "confounder->treatment"
+    scm_memory.set_active_adapter(active_edge_2)
+    generated_text_2 = scm_memory.forward(prompt)
+    print(f"Generated text with '{active_edge_2}' adapter: '{generated_text_2}'")

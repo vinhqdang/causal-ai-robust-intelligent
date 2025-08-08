@@ -1,0 +1,8 @@
+torch
+transformers
+adapters
+einops
+hydra-core
+scikit-learn
+pytorch-lightning
+pytest

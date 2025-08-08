@@ -48,6 +48,23 @@ class CounterfactualReplayBuffer:
         
         return parent_configs, outcomes
 
+    def sample_cf(self, edge: str, batch_size: int):
+        """
+        Samples a batch of parent-outcome pairs and generates counterfactuals.
+        """
+        parent_configs, outcomes = self.sample(edge, batch_size)
+        if parent_configs is None:
+            return None, None, None
+            
+        # Generate counterfactuals by adding noise to the float version of the tensor
+        noise = torch.randn_like(parent_configs.float()) * 0.1
+        counterfactual_parents = (parent_configs.float() + noise).long()
+        
+        # Ensure the counterfactuals are still valid token IDs
+        counterfactual_parents = torch.clamp(counterfactual_parents, 0, 50256)
+        
+        return parent_configs, outcomes, counterfactual_parents
+
     def generate_counterfactual(self, model, edge: str, parent_config: torch.Tensor, new_val: float):
         """
         Generates a counterfactual outcome for a given parent configuration.

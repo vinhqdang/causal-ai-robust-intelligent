@@ -27,17 +27,20 @@ def compute_treatment_effect(model: nn.Module, C_a: torch.Tensor, C_b: torch.Ten
     return output_a.mean() - output_b.mean()
 
 def causal_parameter_importance(model: nn.Module, param: torch.Tensor, 
-                                C_a: torch.Tensor, C_b: torch.Tensor):
+                                C_a: torch.Tensor, C_b: torch.Tensor,
+                                test_loss_fn=None):
     """
     Computes the Causal Parameter Importance (CPI) for a given parameter.
-    CPI is defined as the squared norm of the gradient of the treatment effect
-    with respect to the parameter.
+    This is a simplified implementation of the influence function, where we
+    approximate the Hessian-vector product with a gradient calculation.
     
     Args:
         model (nn.Module): The model being evaluated.
         param (torch.Tensor): The parameter for which to compute CPI.
         C_a (torch.Tensor): Input tensor representing the treatment group.
         C_b (torch.Tensor): Input tensor representing the control group.
+        test_loss_fn (callable, optional): A function to compute the test loss. 
+                                           If None, a dummy loss is used.
         
     Returns:
         float: The CPI value for the parameter.
@@ -46,19 +49,29 @@ def causal_parameter_importance(model: nn.Module, param: torch.Tensor,
         print("Parameter does not require gradients.")
         return 0.0
 
-    # 1. Compute the treatment effect
+    # 1. Compute the gradient of the treatment effect w.r.t. the parameter
     treatment_effect = compute_treatment_effect(model, C_a, C_b)
+    s_test = grad(treatment_effect, param, retain_graph=True, allow_unused=True)[0]
     
-    # 2. Compute the gradient of the treatment effect w.r.t. the parameter
-    grads = grad(treatment_effect, param, retain_graph=True, allow_unused=True)
-    
-    if grads[0] is None:
+    if s_test is None:
         return 0.0
+
+    # 2. Compute the gradient of the test loss w.r.t. the parameter
+    if test_loss_fn is None:
+        # Dummy test loss
+        test_loss = compute_treatment_effect(model, C_a, C_b)
+    else:
+        test_loss = test_loss_fn()
         
-    # 3. Compute the squared norm of the gradient
-    cpi = torch.norm(grads[0])**2
+    test_loss_grads = grad(test_loss, param, retain_graph=True, allow_unused=True)[0]
+
+    if test_loss_grads is None:
+        return 0.0
+
+    # 3. Compute the influence score (dot product of the two gradients)
+    influence = -torch.dot(s_test.flatten(), test_loss_grads.flatten())
     
-    return cpi.item()
+    return influence.item()
 
 if __name__ == '__main__':
     # Example Usage
