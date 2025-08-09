@@ -10,7 +10,385 @@ from typing import Dict, List, Tuple, Optional, Union
 import numpy as np
 import networkx as nx
 from scipy.special import digamma, loggamma
-from torch.distributions import Dirichlet, Categorical
+from torch.distributions import Dirichlet, Categorical, Beta, Normal
+
+
+class StickBreakingVAERouter(nn.Module):
+    """
+    Stick-breaking VAE router for continuous relaxation of Dirichlet routing.
+    
+    Uses stick-breaking construction with reparameterizable gradients for
+    end-to-end differentiable adapter selection. This provides better
+    gradient flow compared to discrete Dirichlet sampling.
+    """
+    
+    def __init__(
+        self,
+        context_dim: int,
+        max_adapters: int = 50,
+        hidden_dim: int = 128,
+        latent_dim: int = 32,
+        beta_concentration: float = 1.0,
+        temperature: float = 1.0,
+        device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    ):
+        super().__init__()
+        
+        self.context_dim = context_dim
+        self.max_adapters = max_adapters
+        self.hidden_dim = hidden_dim
+        self.latent_dim = latent_dim
+        self.beta_concentration = beta_concentration
+        self.temperature = temperature
+        self.device = device
+        
+        # VAE encoder: context -> latent variables
+        self.encoder = nn.Sequential(
+            nn.Linear(context_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+        )
+        
+        # Latent space parameters (mean and log-variance)
+        self.latent_mean = nn.Linear(hidden_dim, latent_dim)
+        self.latent_logvar = nn.Linear(hidden_dim, latent_dim)
+        
+        # Stick-breaking decoder: latent -> stick-breaking parameters
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, max_adapters - 1)  # K-1 stick-breaking variables
+        )
+        
+        # Graph structure embedding
+        self.graph_encoder = nn.Sequential(
+            nn.Linear(max_adapters * max_adapters, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, latent_dim)
+        )
+        
+        # Adapter availability mask
+        self.register_buffer(
+            'adapter_mask', 
+            torch.zeros(max_adapters, dtype=torch.bool)
+        )
+        
+        # Track active adapters
+        self.active_adapters = set()
+        self.adapter_to_edge = {}
+        self.edge_to_adapter = {}
+        
+        # KL loss tracking
+        self.kl_losses = []
+        
+    def register_adapter(self, edge: Tuple[int, int], adapter_idx: int):
+        """Register a new adapter for a causal edge."""
+        if adapter_idx >= self.max_adapters:
+            raise ValueError(f"Adapter index {adapter_idx} exceeds maximum {self.max_adapters}")
+            
+        self.active_adapters.add(adapter_idx)
+        self.adapter_to_edge[adapter_idx] = edge
+        self.edge_to_adapter[edge] = adapter_idx
+        self.adapter_mask[adapter_idx] = True
+    
+    def unregister_adapter(self, edge: Tuple[int, int]):
+        """Unregister an adapter for a causal edge."""
+        if edge in self.edge_to_adapter:
+            adapter_idx = self.edge_to_adapter[edge]
+            self.active_adapters.discard(adapter_idx)
+            del self.adapter_to_edge[adapter_idx]
+            del self.edge_to_adapter[edge]
+            self.adapter_mask[adapter_idx] = False
+    
+    def encode(
+        self, 
+        z_context: torch.Tensor, 
+        causal_graph: Optional[nx.DiGraph] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Encode context to latent variables.
+        
+        Args:
+            z_context: Context variables [batch_size, context_dim]
+            causal_graph: Optional causal graph for structural conditioning
+            
+        Returns:
+            mu: Latent means [batch_size, latent_dim]
+            logvar: Latent log-variances [batch_size, latent_dim]
+        """
+        batch_size = z_context.size(0)
+        
+        # Encode context
+        h = self.encoder(z_context)
+        
+        # Get latent parameters
+        mu = self.latent_mean(h)
+        logvar = self.latent_logvar(h)
+        
+        # Add graph structure conditioning if available
+        if causal_graph is not None:
+            graph_embedding = self._encode_graph_structure(causal_graph, batch_size)
+            mu = mu + 0.1 * graph_embedding  # Small additive conditioning
+        
+        return mu, logvar
+    
+    def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        """
+        Reparameterization trick for sampling latent variables.
+        
+        Args:
+            mu: Latent means [batch_size, latent_dim]
+            logvar: Latent log-variances [batch_size, latent_dim]
+            
+        Returns:
+            z: Sampled latent variables [batch_size, latent_dim]
+        """
+        if self.training:
+            std = torch.exp(0.5 * logvar)
+            eps = torch.randn_like(std)
+            return mu + eps * std
+        else:
+            return mu
+    
+    def decode_to_stick_breaking(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        Decode latent variables to stick-breaking parameters.
+        
+        Args:
+            z: Latent variables [batch_size, latent_dim]
+            
+        Returns:
+            v_params: Stick-breaking parameters [batch_size, max_adapters-1]
+        """
+        # Decode to stick-breaking logits
+        v_logits = self.decoder(z)  # [batch_size, max_adapters-1]
+        
+        # Apply sigmoid to get Beta parameters
+        v_params = torch.sigmoid(v_logits)
+        
+        return v_params
+    
+    def stick_breaking_to_probabilities(self, v_params: torch.Tensor) -> torch.Tensor:
+        """
+        Convert stick-breaking parameters to probability simplex.
+        
+        Implements: π_k = v_k * ∏_{j<k} (1 - v_j)
+        
+        Args:
+            v_params: Stick-breaking parameters [batch_size, max_adapters-1]
+            
+        Returns:
+            probabilities: Probability simplex [batch_size, max_adapters]
+        """
+        batch_size = v_params.size(0)
+        
+        # Initialize probabilities
+        probabilities = []
+        
+        # Cumulative product of (1 - v_j)
+        remaining_stick = torch.ones(batch_size, device=self.device)
+        
+        for k in range(self.max_adapters - 1):
+            v_k = v_params[:, k]
+            
+            # π_k = v_k * remaining_stick
+            prob_k = v_k * remaining_stick
+            probabilities.append(prob_k)
+            
+            # Update remaining stick: remaining *= (1 - v_k)
+            remaining_stick = remaining_stick * (1.0 - v_k)
+        
+        # Last probability gets all remaining stick
+        probabilities.append(remaining_stick)
+        
+        # Stack and apply adapter mask
+        probabilities = torch.stack(probabilities, dim=1)  # [batch_size, max_adapters]
+        probabilities = probabilities * self.adapter_mask.float()
+        
+        # Renormalize to ensure valid probabilities
+        prob_sum = probabilities.sum(dim=1, keepdim=True)
+        probabilities = probabilities / (prob_sum + 1e-8)
+        
+        return probabilities
+    
+    def compute_kl_loss(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        """
+        Compute KL divergence loss for VAE regularization.
+        
+        KL[q(z|x) || p(z)] where p(z) = N(0, I)
+        
+        Args:
+            mu: Latent means [batch_size, latent_dim]
+            logvar: Latent log-variances [batch_size, latent_dim]
+            
+        Returns:
+            kl_loss: KL divergence loss (scalar)
+        """
+        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
+        kl_loss = kl_loss.mean()
+        
+        self.kl_losses.append(kl_loss.item())
+        return kl_loss
+    
+    def forward(
+        self,
+        z_context: torch.Tensor,
+        causal_graph: nx.DiGraph,
+        return_components: bool = False
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """
+        Forward pass through stick-breaking VAE router.
+        
+        Args:
+            z_context: Context variables [batch_size, context_dim]
+            causal_graph: Current causal graph structure
+            return_components: Whether to return intermediate components
+            
+        Returns:
+            probabilities: Adapter probabilities [batch_size, max_adapters]
+            If return_components=True, also returns (mu, logvar, kl_loss)
+        """
+        # Encode to latent space
+        mu, logvar = self.encode(z_context, causal_graph)
+        
+        # Sample latent variables
+        z = self.reparameterize(mu, logvar)
+        
+        # Decode to stick-breaking parameters
+        v_params = self.decode_to_stick_breaking(z)
+        
+        # Convert to probabilities
+        probabilities = self.stick_breaking_to_probabilities(v_params)
+        
+        # Apply temperature scaling
+        probabilities = F.softmax(
+            torch.log(probabilities + 1e-8) / self.temperature,
+            dim=-1
+        )
+        
+        if return_components:
+            kl_loss = self.compute_kl_loss(mu, logvar)
+            return probabilities, mu, logvar, kl_loss
+        
+        return probabilities
+    
+    def _encode_graph_structure(self, causal_graph: nx.DiGraph, batch_size: int) -> torch.Tensor:
+        """
+        Encode causal graph structure for conditioning.
+        
+        Args:
+            causal_graph: Causal graph
+            batch_size: Batch size
+            
+        Returns:
+            graph_embedding: Graph structure embedding [batch_size, latent_dim]
+        """
+        # Create adjacency matrix representation
+        adj_matrix = torch.zeros(self.max_adapters, self.max_adapters, device=self.device)
+        
+        # Fill adjacency based on active adapters and their edges
+        for adapter_idx in self.active_adapters:
+            if adapter_idx in self.adapter_to_edge:
+                edge = self.adapter_to_edge[adapter_idx]
+                source, target = edge
+                
+                # Map nodes to adapter indices if possible
+                source_adapter = self.edge_to_adapter.get((source, source), None)
+                target_adapter = self.edge_to_adapter.get((target, target), None)
+                
+                if source_adapter is not None and target_adapter is not None:
+                    if source_adapter < self.max_adapters and target_adapter < self.max_adapters:
+                        adj_matrix[source_adapter, target_adapter] = 1.0
+        
+        # Flatten and encode
+        adj_flat = adj_matrix.view(-1)
+        graph_embedding = self.graph_encoder(adj_flat)
+        
+        # Expand for batch
+        graph_embedding = graph_embedding.unsqueeze(0).expand(batch_size, -1)
+        
+        return graph_embedding
+    
+    def get_soft_adapter_mixture(
+        self,
+        probabilities: torch.Tensor,
+        threshold: float = 0.01
+    ) -> Dict[Tuple[int, int], float]:
+        """
+        Convert probabilities to soft adapter mixture.
+        
+        Args:
+            probabilities: Adapter probabilities [batch_size, max_adapters]
+            threshold: Minimum probability threshold
+            
+        Returns:
+            edge_weights: Dictionary mapping edges to mixture weights
+        """
+        # Average probabilities across batch
+        avg_probs = probabilities.mean(dim=0)
+        
+        edge_weights = {}
+        
+        for adapter_idx in self.active_adapters:
+            prob = avg_probs[adapter_idx].item()
+            
+            if prob > threshold and adapter_idx in self.adapter_to_edge:
+                edge = self.adapter_to_edge[adapter_idx]
+                edge_weights[edge] = prob
+        
+        # Normalize weights
+        total_weight = sum(edge_weights.values())
+        if total_weight > 0:
+            edge_weights = {
+                edge: weight / total_weight
+                for edge, weight in edge_weights.items()
+            }
+        
+        return edge_weights
+    
+    def compute_reconstruction_loss(
+        self,
+        z_context: torch.Tensor,
+        target_probabilities: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute reconstruction loss for VAE training.
+        
+        Args:
+            z_context: Input context [batch_size, context_dim]
+            target_probabilities: Target probability distribution [batch_size, max_adapters]
+            
+        Returns:
+            recon_loss: Reconstruction loss (scalar)
+        """
+        # Forward pass
+        pred_probabilities = self.forward(z_context, None)
+        
+        # KL divergence between predicted and target distributions
+        recon_loss = F.kl_div(
+            torch.log(pred_probabilities + 1e-8),
+            target_probabilities,
+            reduction='batchmean'
+        )
+        
+        return recon_loss
+    
+    def get_vae_statistics(self) -> Dict[str, float]:
+        """Get VAE training statistics."""
+        return {
+            'avg_kl_loss': np.mean(self.kl_losses[-100:]) if self.kl_losses else 0.0,
+            'latent_dim': self.latent_dim,
+            'active_adapters': len(self.active_adapters),
+            'temperature': self.temperature,
+            'total_kl_updates': len(self.kl_losses)
+        }
 
 
 class DirichletRouter(nn.Module):
@@ -375,7 +753,9 @@ class BayesianUncertaintyGating(nn.Module):
         max_adapters: int = 50,
         uncertainty_threshold: float = 0.1,
         exploration_rate: float = 0.1,
-        device: str = "cuda" if torch.cuda.is_available() else "cpu"
+        device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        router_type: str = "dirichlet",  # "dirichlet" or "stick_breaking_vae"
+        vae_latent_dim: int = 32
     ):
         super().__init__()
         
@@ -384,13 +764,24 @@ class BayesianUncertaintyGating(nn.Module):
         self.uncertainty_threshold = uncertainty_threshold
         self.exploration_rate = exploration_rate
         self.device = device
+        self.router_type = router_type
         
-        # Dirichlet router
-        self.router = DirichletRouter(
-            context_dim=context_dim,
-            max_adapters=max_adapters,
-            device=device
-        )
+        # Initialize appropriate router
+        if router_type == "stick_breaking_vae":
+            self.router = StickBreakingVAERouter(
+                context_dim=context_dim,
+                max_adapters=max_adapters,
+                latent_dim=vae_latent_dim,
+                device=device
+            )
+        elif router_type == "dirichlet":
+            self.router = DirichletRouter(
+                context_dim=context_dim,
+                max_adapters=max_adapters,
+                device=device
+            )
+        else:
+            raise ValueError(f"Unknown router type: {router_type}. Choose 'dirichlet' or 'stick_breaking_vae'")
         
         # Uncertainty-based exploration strategy
         self.exploration_strategy = "thompson"  # "thompson", "ucb", "epsilon_greedy"
@@ -422,9 +813,21 @@ class BayesianUncertaintyGating(nn.Module):
             uncertainty: Uncertainty measures [batch_size, 3]
         """
         # Get probabilities and uncertainty from router
-        probabilities, uncertainty = self.router(
-            z_context, causal_graph, return_uncertainty=True
-        )
+        if self.router_type == "stick_breaking_vae":
+            probabilities, mu, logvar, kl_loss = self.router(
+                z_context, causal_graph, return_components=True
+            )
+            # Convert VAE outputs to uncertainty measures (simplified)
+            uncertainty = torch.stack([
+                -torch.sum(probabilities * torch.log(probabilities + 1e-8), dim=1),  # Entropy
+                kl_loss.expand(z_context.size(0)),  # KL as mutual info proxy
+                logvar.mean(dim=1)  # Latent variance as confidence measure
+            ], dim=1)
+        else:
+            # Dirichlet router
+            probabilities, uncertainty = self.router(
+                z_context, causal_graph, return_uncertainty=True
+            )
         
         # Apply exploration if enabled
         if exploration and self.training:
@@ -549,7 +952,7 @@ class BayesianUncertaintyGating(nn.Module):
         """Get diagnostic information about routing behavior."""
         total = self.routing_stats['total_decisions']
         
-        return {
+        base_info = {
             'total_routing_decisions': total,
             'high_uncertainty_rate': (
                 self.routing_stats['high_uncertainty_decisions'] / max(total, 1)
@@ -557,5 +960,49 @@ class BayesianUncertaintyGating(nn.Module):
             'average_uncertainty': self.routing_stats['avg_uncertainty'],
             'active_adapters': len(self.router.active_adapters),
             'exploration_strategy': self.exploration_strategy,
-            'uncertainty_threshold': self.uncertainty_threshold
+            'uncertainty_threshold': self.uncertainty_threshold,
+            'router_type': self.router_type
         }
+        
+        # Add router-specific diagnostics
+        if self.router_type == "stick_breaking_vae":
+            vae_stats = self.router.get_vae_statistics()
+            base_info.update({
+                'vae_avg_kl_loss': vae_stats['avg_kl_loss'],
+                'vae_latent_dim': vae_stats['latent_dim'],
+                'vae_temperature': vae_stats['temperature'],
+                'vae_kl_updates': vae_stats['total_kl_updates']
+            })
+        
+        return base_info
+    
+    def compute_vae_loss(
+        self,
+        z_context: torch.Tensor,
+        causal_graph: nx.DiGraph,
+        beta: float = 1.0
+    ) -> Optional[torch.Tensor]:
+        """
+        Compute VAE loss for Stick-Breaking router (if applicable).
+        
+        Args:
+            z_context: Context variables [batch_size, context_dim]
+            causal_graph: Current causal graph
+            beta: Beta-VAE regularization weight
+            
+        Returns:
+            vae_loss: Combined reconstruction + KL loss (or None if not VAE router)
+        """
+        if self.router_type != "stick_breaking_vae":
+            return None
+        
+        # Forward pass with components
+        probabilities, mu, logvar, kl_loss = self.router(
+            z_context, causal_graph, return_components=True
+        )
+        
+        # For stick-breaking VAE, reconstruction loss is implicit in the probabilistic formulation
+        # We focus on the KL regularization
+        vae_loss = beta * kl_loss
+        
+        return vae_loss

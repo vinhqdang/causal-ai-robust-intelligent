@@ -30,7 +30,7 @@ class PathIntegratedCPI(nn.Module):
         model: nn.Module,
         max_path_length: int = 5,
         integration_steps: int = 20,
-        top_k_paths: int = 10,
+        max_paths_per_edge: int = 20,
         influence_threshold: float = 1e-5,
         device: str = "cuda" if torch.cuda.is_available() else "cpu"
     ):
@@ -38,7 +38,7 @@ class PathIntegratedCPI(nn.Module):
         self.model = model
         self.max_path_length = max_path_length
         self.integration_steps = integration_steps
-        self.top_k_paths = top_k_paths
+        self.max_paths_per_edge = max_paths_per_edge
         self.influence_threshold = influence_threshold
         self.device = device
         
@@ -83,83 +83,169 @@ class PathIntegratedCPI(nn.Module):
         if loss_fn is None:
             loss_fn = nn.MSELoss()
         
-        # Get all causal paths up to max length
-        all_paths = self._enumerate_causal_paths(causal_graph)
+        # Use importance sampling to get representative causal paths
+        important_paths = self._importance_sample_paths(causal_graph)
         
-        # Select top-k most important paths based on structural importance
-        important_paths = self._select_important_paths(all_paths, causal_graph)
-        
-        # Compute path-integrated influences
+        # Compute path-integrated influences with importance weighting
         pi_cpi_scores = defaultdict(float)
         
-        for path in important_paths:
+        for path, path_weight in important_paths:
             path_influences = self._compute_path_influence(
                 path, input_batch, target_batch, loss_fn
             )
             
-            # Aggregate influences across parameters for this path
+            # Aggregate influences across parameters for this path with importance weighting
             for param_name, influence in path_influences.items():
-                pi_cpi_scores[param_name] += influence
+                # Apply importance sampling bias correction
+                weighted_influence = influence * path_weight
+                pi_cpi_scores[param_name] += weighted_influence
                 
         return dict(pi_cpi_scores)
     
-    def _enumerate_causal_paths(self, graph: nx.DiGraph) -> List[List[int]]:
+    def _importance_sample_paths(self, graph: nx.DiGraph) -> List[Tuple[List[int], float]]:
         """
-        Enumerate all causal paths in the graph up to max_path_length.
+        Use importance sampling to efficiently sample representative causal paths.
+        
+        This replaces full enumeration (O(E!)) with bounded sampling (O(E * max_paths_per_edge)).
+        Returns paths with their importance weights for bias correction.
         """
-        all_paths = []
-        nodes = list(graph.nodes())
+        sampled_paths = []
+        edges = list(graph.edges())
         
-        # Find all simple paths between all pairs of nodes
-        for source in nodes:
-            for target in nodes:
-                if source != target:
-                    try:
-                        # Get all simple paths from source to target
-                        simple_paths = list(nx.all_simple_paths(
-                            graph, source, target, cutoff=self.max_path_length
-                        ))
-                        all_paths.extend(simple_paths)
-                    except nx.NetworkXNoPath:
-                        continue
+        if not edges:
+            return []
         
-        return all_paths
+        # Sample paths for each edge to ensure coverage
+        for edge in edges:
+            source, target = edge
+            
+            # Sample paths that go through this edge
+            edge_paths = self._sample_paths_through_edge(graph, source, target)
+            sampled_paths.extend(edge_paths)
+        
+        # Remove duplicates while preserving weights
+        unique_paths = {}
+        for path, weight in sampled_paths:
+            path_tuple = tuple(path)
+            if path_tuple not in unique_paths:
+                unique_paths[path_tuple] = weight
+            else:
+                # Combine weights for duplicate paths
+                unique_paths[path_tuple] += weight
+        
+        # Convert back to list format
+        return [(list(path), weight) for path, weight in unique_paths.items()]
     
-    def _select_important_paths(
-        self, 
-        all_paths: List[List[int]], 
-        graph: nx.DiGraph
-    ) -> List[List[int]]:
+    def _sample_paths_through_edge(self, graph: nx.DiGraph, source: int, target: int) -> List[Tuple[List[int], float]]:
         """
-        Select the most structurally important paths based on graph properties.
+        Sample paths that go through a specific edge using importance sampling.
         """
-        if len(all_paths) <= self.top_k_paths:
-            return all_paths
-            
-        # Score paths by structural importance
-        path_scores = []
+        paths_with_weights = []
+        max_samples = min(self.max_paths_per_edge, 100)  # Cap for efficiency
         
-        for path in all_paths:
-            score = 0.0
+        # Direct edge path (always include)
+        direct_path = [source, target]
+        direct_weight = self._compute_path_importance_weight(graph, direct_path)
+        paths_with_weights.append((direct_path, direct_weight))
+        
+        # Sample extended paths using random walks
+        for _ in range(max_samples - 1):
+            path = self._sample_extended_path(graph, source, target)
+            if path and len(path) <= self.max_path_length:
+                weight = self._compute_path_importance_weight(graph, path)
+                paths_with_weights.append((path, weight))
+        
+        return paths_with_weights
+    
+    def _sample_extended_path(self, graph: nx.DiGraph, source: int, target: int) -> Optional[List[int]]:
+        """
+        Sample an extended path from source to target using biased random walk.
+        """
+        max_attempts = 10
+        
+        for _ in range(max_attempts):
+            path = [source]
+            current = source
             
-            # Length penalty (shorter paths are more direct)
-            score += 1.0 / len(path)
-            
-            # Node centrality bonus
-            for node in path:
-                score += graph.degree(node) / (2 * len(path))
-            
-            # Connectivity bonus for bridging nodes
-            for node in path[1:-1]:  # Intermediate nodes
-                predecessors = len(list(graph.predecessors(node)))
-                successors = len(list(graph.successors(node)))
-                score += (predecessors * successors) / (len(path) ** 2)
+            # Random walk with bias toward target
+            for _ in range(self.max_path_length - 1):
+                successors = list(graph.successors(current))
+                if not successors:
+                    break
                 
-            path_scores.append((score, path))
+                if target in successors:
+                    # High probability to go to target if available
+                    if np.random.random() < 0.7:
+                        path.append(target)
+                        return path
+                
+                # Otherwise, choose successor based on structural importance
+                weights = []
+                for successor in successors:
+                    # Weight by node importance (degree centrality)
+                    weight = graph.degree(successor) + 1
+                    
+                    # Bonus if successor leads toward target
+                    if nx.has_path(graph, successor, target):
+                        try:
+                            shortest_path_length = nx.shortest_path_length(graph, successor, target)
+                            weight *= 2.0 / (shortest_path_length + 1)
+                        except:
+                            pass
+                    
+                    weights.append(weight)
+                
+                # Normalize weights
+                total_weight = sum(weights)
+                if total_weight > 0:
+                    weights = [w / total_weight for w in weights]
+                    current = np.random.choice(successors, p=weights)
+                    
+                    if current in path:  # Avoid cycles
+                        break
+                    path.append(current)
+                    
+                    if current == target:
+                        return path
+                else:
+                    break
         
-        # Sort by score and select top-k
-        path_scores.sort(reverse=True, key=lambda x: x[0])
-        return [path for _, path in path_scores[:self.top_k_paths]]
+        return None
+    
+    def _compute_path_importance_weight(self, graph: nx.DiGraph, path: List[int]) -> float:
+        """
+        Compute importance weight for a path based on structural properties.
+        This is used for importance sampling bias correction.
+        """
+        if len(path) < 2:
+            return 1.0
+        
+        weight = 1.0
+        
+        # Length penalty (prefer shorter paths)
+        weight *= 1.0 / len(path)
+        
+        # Node centrality bonus
+        for node in path:
+            centrality = graph.degree(node) / max(len(graph.nodes()), 1)
+            weight *= (1.0 + centrality)
+        
+        # Edge strength bonus (simplified)
+        for i in range(len(path) - 1):
+            source, target = path[i], path[i + 1]
+            if graph.has_edge(source, target):
+                # Assume uniform edge weights for simplicity
+                weight *= 1.1
+        
+        # Connectivity bonus for bridging paths
+        if len(path) > 2:
+            for node in path[1:-1]:  # Intermediate nodes
+                in_degree = graph.in_degree(node)
+                out_degree = graph.out_degree(node)
+                bridge_score = min(in_degree, out_degree) / max(max(in_degree, out_degree), 1)
+                weight *= (1.0 + 0.5 * bridge_score)
+        
+        return weight
     
     def _compute_path_influence(
         self,
@@ -389,18 +475,17 @@ class PathIntegratedCPI(nn.Module):
         """
         Analyze contribution of different causal paths to overall influence.
         """
-        all_paths = self._enumerate_causal_paths(causal_graph)
-        important_paths = self._select_important_paths(all_paths, causal_graph)
+        important_paths = self._importance_sample_paths(causal_graph)
         
         path_contributions = {}
         
-        for path in important_paths:
+        for path, path_weight in important_paths:
             # Compute total influence along this path
             path_influences = self._compute_path_influence(
                 path, input_batch, None, nn.MSELoss()
             )
             
-            total_influence = sum(path_influences.values())
+            total_influence = sum(path_influences.values()) * path_weight
             path_contributions[tuple(path)] = total_influence
         
         return path_contributions

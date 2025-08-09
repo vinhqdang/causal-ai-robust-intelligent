@@ -10,6 +10,7 @@ from typing import Dict, List, Tuple, Optional, Set
 from scipy.stats import chi2
 import networkx as nx
 from sklearn.gaussian_process.kernels import RBF
+from scipy.linalg import expm
 
 
 class OnlineGraphRefinement(nn.Module):
@@ -27,7 +28,9 @@ class OnlineGraphRefinement(nn.Module):
         kernel_bandwidth: float = 1.0,
         alpha_cit: float = 0.01,
         min_samples: int = 50,
-        max_edges: int = 100
+        max_edges: int = 100,
+        notears_lambda: float = 1.0,
+        acyclicity_tolerance: float = 1e-8
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -35,6 +38,8 @@ class OnlineGraphRefinement(nn.Module):
         self.alpha_cit = alpha_cit  # Significance level for conditional independence tests
         self.min_samples = min_samples
         self.max_edges = max_edges
+        self.notears_lambda = notears_lambda  # Weight for NOTEARS acyclicity penalty
+        self.acyclicity_tolerance = acyclicity_tolerance  # Tolerance for acyclicity check
         
         # Initialize RBF kernel for conditional independence testing
         self.kernel = RBF(length_scale=kernel_bandwidth)
@@ -89,6 +94,9 @@ class OnlineGraphRefinement(nn.Module):
         # Test for edges to remove
         edges_to_remove = self._test_for_edge_removal(recent_samples, refined_graph)
         refined_graph.remove_edges_from(edges_to_remove)
+        
+        # Enforce acyclicity using NOTEARS penalty
+        refined_graph = self._enforce_acyclicity(refined_graph, recent_samples)
         
         # Update internal adjacency matrix
         self._update_adjacency_matrix(refined_graph)
@@ -291,5 +299,144 @@ class OnlineGraphRefinement(nn.Module):
             'buffer_size': len(self.latent_buffer),
             'current_edges': int(self.adjacency_matrix.sum()),
             'test_history_length': len(self.test_statistics_history),
-            'alpha_cit': self.alpha_cit
+            'alpha_cit': self.alpha_cit,
+            'is_acyclic': self._is_acyclic(nx.from_numpy_array(self.adjacency_matrix.numpy(), create_using=nx.DiGraph))
         }
+    
+    def _enforce_acyclicity(self, graph: nx.DiGraph, samples: np.ndarray) -> nx.DiGraph:
+        """
+        Enforce acyclicity using NOTEARS-style optimization to remove cycles.
+        
+        This implements a greedy cycle-breaking approach guided by NOTEARS penalty.
+        """
+        if self._is_acyclic(graph):
+            return graph
+            
+        # Convert to adjacency matrix for NOTEARS computation
+        adj_matrix = nx.to_numpy_array(graph)
+        n_nodes = adj_matrix.shape[0]
+        
+        # Iteratively remove edges that contribute most to cyclicity
+        refined_adj = adj_matrix.copy()
+        max_iterations = 50  # Prevent infinite loops
+        
+        for _ in range(max_iterations):
+            if self._is_acyclic_matrix(refined_adj):
+                break
+                
+            # Compute NOTEARS penalty for current graph
+            acyclicity_penalty = self._compute_notears_penalty(refined_adj)
+            
+            if acyclicity_penalty < self.acyclicity_tolerance:
+                break
+                
+            # Find edge that reduces cyclicity most when removed
+            best_edge = self._find_best_edge_to_remove(refined_adj, samples)
+            if best_edge is not None:
+                i, j = best_edge
+                refined_adj[i, j] = 0
+            else:
+                break
+        
+        # Convert back to NetworkX graph
+        refined_graph = nx.from_numpy_array(refined_adj, create_using=nx.DiGraph)
+        
+        # Remove edges with zero weight (artifacts from conversion)
+        edges_to_remove = [(u, v) for u, v, d in refined_graph.edges(data=True) if d.get('weight', 1) == 0]
+        refined_graph.remove_edges_from(edges_to_remove)
+        
+        return refined_graph
+    
+    def _is_acyclic(self, graph: nx.DiGraph) -> bool:
+        """Check if the graph is acyclic."""
+        try:
+            return nx.is_directed_acyclic_graph(graph)
+        except:
+            return False
+    
+    def _is_acyclic_matrix(self, adj_matrix: np.ndarray) -> bool:
+        """Check if adjacency matrix represents acyclic graph using NOTEARS constraint."""
+        penalty = self._compute_notears_penalty(adj_matrix)
+        return penalty < self.acyclicity_tolerance
+    
+    def _compute_notears_penalty(self, adj_matrix: np.ndarray) -> float:
+        """
+        Compute NOTEARS acyclicity penalty: tr(exp(W ⊙ W)) - d
+        where W is the weighted adjacency matrix and d is the number of nodes.
+        """
+        n_nodes = adj_matrix.shape[0]
+        
+        # Element-wise square of adjacency matrix
+        W_squared = adj_matrix * adj_matrix
+        
+        try:
+            # Compute matrix exponential
+            exp_W = expm(W_squared)
+            
+            # NOTEARS penalty: tr(exp(W ⊙ W)) - d
+            penalty = np.trace(exp_W) - n_nodes
+            
+        except (np.linalg.LinAlgError, OverflowError):
+            # Fallback to simple cycle detection if matrix exponential fails
+            temp_graph = nx.from_numpy_array(adj_matrix, create_using=nx.DiGraph)
+            penalty = 1000.0 if not nx.is_directed_acyclic_graph(temp_graph) else 0.0
+        
+        return max(0.0, penalty)  # Penalty should be non-negative
+    
+    def _find_best_edge_to_remove(self, adj_matrix: np.ndarray, samples: np.ndarray) -> Optional[Tuple[int, int]]:
+        """
+        Find the edge that, when removed, reduces the acyclicity penalty most
+        while maintaining reasonable causal strength.
+        """
+        current_penalty = self._compute_notears_penalty(adj_matrix)
+        best_edge = None
+        best_penalty_reduction = 0
+        
+        # Get current edges
+        edges = [(i, j) for i in range(adj_matrix.shape[0]) 
+                for j in range(adj_matrix.shape[1]) if adj_matrix[i, j] > 0]
+        
+        for i, j in edges:
+            # Temporarily remove edge
+            test_adj = adj_matrix.copy()
+            test_adj[i, j] = 0
+            
+            # Compute penalty reduction
+            new_penalty = self._compute_notears_penalty(test_adj)
+            penalty_reduction = current_penalty - new_penalty
+            
+            # Prefer edges with high penalty reduction and low causal strength
+            causal_strength = self._compute_causal_strength(samples, i, j) if samples is not None else 0.5
+            
+            # Score combines penalty reduction with inverse causal strength
+            score = penalty_reduction - 0.1 * causal_strength
+            
+            if score > best_penalty_reduction:
+                best_penalty_reduction = score
+                best_edge = (i, j)
+        
+        return best_edge
+    
+    def _compute_causal_strength(self, samples: np.ndarray, i: int, j: int) -> float:
+        """
+        Compute causal strength between variables i and j using HSIC.
+        Higher values indicate stronger causal relationships.
+        """
+        if samples is None or i >= samples.shape[1] or j >= samples.shape[1]:
+            return 0.5  # Default moderate strength
+        
+        X_i = samples[:, i].reshape(-1, 1)
+        X_j = samples[:, j].reshape(-1, 1)
+        
+        try:
+            K_i = self.kernel(X_i)
+            K_j = self.kernel(X_j)
+            
+            n = K_i.shape[0]
+            H = np.eye(n) - np.ones((n, n)) / n
+            strength = np.trace(K_i @ H @ K_j @ H) / (n - 1)**2
+            
+            return max(0.0, min(1.0, float(strength)))  # Clamp to [0, 1]
+            
+        except:
+            return 0.5  # Default if computation fails

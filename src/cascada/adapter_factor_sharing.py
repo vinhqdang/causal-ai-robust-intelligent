@@ -31,7 +31,11 @@ class AdapterFactorSharing(nn.Module):
         rank_2: int = 8,
         max_edges: int = 100,
         initialization: str = "xavier",
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        target_variance_ratio: float = 0.95,
+        dynamic_rank: bool = True,
+        min_rank: int = 2,
+        max_rank: int = 32
     ):
         super().__init__()
         
@@ -41,6 +45,16 @@ class AdapterFactorSharing(nn.Module):
         self.rank_2 = rank_2
         self.max_edges = max_edges
         self.dropout = nn.Dropout(dropout)
+        
+        # Dynamic rank selection parameters
+        self.target_variance_ratio = target_variance_ratio
+        self.dynamic_rank = dynamic_rank
+        self.min_rank = min_rank
+        self.max_rank = max_rank
+        
+        # Track adaptation history for rank adjustment
+        self.adaptation_history = []
+        self.rank_adjustment_interval = 100  # Adjust ranks every N updates
         
         # Core Tucker tensor B [rank_1 × rank_2 × adapter_dim × base_model_dim]
         self.core_tensor = nn.Parameter(
@@ -252,6 +266,12 @@ class AdapterFactorSharing(nn.Module):
         """
         if not gradients:
             return
+        
+        # Record adaptation step
+        self.adaptation_history.append(len(gradients))
+        
+        # Check if ranks need adjustment
+        self.adapt_ranks_if_needed()
             
         # Collect gradients for active edges
         edge_grads = []
@@ -414,3 +434,244 @@ class AdapterFactorSharing(nn.Module):
             outputs.append(adapted_sample)
         
         return torch.cat(outputs, dim=0)
+    
+    def _compute_adapter_variance_explained(
+        self, 
+        edge_adapters: List[torch.Tensor]
+    ) -> Tuple[float, float]:
+        """
+        Compute variance explained by current Tucker ranks for edge adapters.
+        
+        Args:
+            edge_adapters: List of adapter tensors [adapter_dim, base_model_dim]
+            
+        Returns:
+            variance_ratio_1: Variance explained by rank_1
+            variance_ratio_2: Variance explained by rank_2
+        """
+        if len(edge_adapters) < 2:
+            return 1.0, 1.0
+        
+        # Stack adapters into tensor [num_edges, adapter_dim, base_model_dim]
+        adapter_tensor = torch.stack(edge_adapters, dim=0)
+        
+        try:
+            # Convert to numpy for SVD analysis
+            adapter_np = adapter_tensor.detach().cpu().numpy()
+            
+            # Perform SVD along first mode (edge dimension)
+            U1, s1, _ = np.linalg.svd(
+                adapter_np.reshape(adapter_np.shape[0], -1), 
+                full_matrices=False
+            )
+            
+            # Compute cumulative variance explained for mode 1
+            s1_squared = s1 ** 2
+            cumulative_var_1 = np.cumsum(s1_squared) / np.sum(s1_squared)
+            
+            # Find variance explained by current rank_1
+            current_rank_1 = min(self.rank_1, len(s1))
+            var_explained_1 = cumulative_var_1[current_rank_1 - 1] if current_rank_1 > 0 else 0.0
+            
+            # Perform SVD along second mode (flattened spatial dimensions)
+            adapter_mode2 = adapter_np.transpose(1, 0, 2).reshape(adapter_np.shape[1], -1)
+            U2, s2, _ = np.linalg.svd(adapter_mode2, full_matrices=False)
+            
+            s2_squared = s2 ** 2
+            cumulative_var_2 = np.cumsum(s2_squared) / np.sum(s2_squared)
+            
+            current_rank_2 = min(self.rank_2, len(s2))
+            var_explained_2 = cumulative_var_2[current_rank_2 - 1] if current_rank_2 > 0 else 0.0
+            
+            return float(var_explained_1), float(var_explained_2)
+            
+        except Exception as e:
+            print(f"Variance computation failed: {e}")
+            return 1.0, 1.0
+    
+    def _compute_optimal_ranks(
+        self, 
+        edge_adapters: List[torch.Tensor]
+    ) -> Tuple[int, int]:
+        """
+        Compute optimal Tucker ranks based on target variance explained.
+        
+        Args:
+            edge_adapters: List of adapter tensors
+            
+        Returns:
+            optimal_rank_1: Optimal rank for mode 1
+            optimal_rank_2: Optimal rank for mode 2
+        """
+        if len(edge_adapters) < 2:
+            return self.rank_1, self.rank_2
+        
+        adapter_tensor = torch.stack(edge_adapters, dim=0)
+        
+        try:
+            adapter_np = adapter_tensor.detach().cpu().numpy()
+            
+            # SVD for mode 1
+            U1, s1, _ = np.linalg.svd(
+                adapter_np.reshape(adapter_np.shape[0], -1),
+                full_matrices=False
+            )
+            
+            s1_squared = s1 ** 2
+            cumulative_var_1 = np.cumsum(s1_squared) / np.sum(s1_squared)
+            
+            # Find minimal rank that achieves target variance
+            optimal_rank_1 = self.min_rank
+            for i, var_ratio in enumerate(cumulative_var_1):
+                if var_ratio >= self.target_variance_ratio:
+                    optimal_rank_1 = min(max(i + 1, self.min_rank), self.max_rank)
+                    break
+            
+            # SVD for mode 2
+            adapter_mode2 = adapter_np.transpose(1, 0, 2).reshape(adapter_np.shape[1], -1)
+            U2, s2, _ = np.linalg.svd(adapter_mode2, full_matrices=False)
+            
+            s2_squared = s2 ** 2
+            cumulative_var_2 = np.cumsum(s2_squared) / np.sum(s2_squared)
+            
+            optimal_rank_2 = self.min_rank
+            for i, var_ratio in enumerate(cumulative_var_2):
+                if var_ratio >= self.target_variance_ratio:
+                    optimal_rank_2 = min(max(i + 1, self.min_rank), self.max_rank)
+                    break
+            
+            return optimal_rank_1, optimal_rank_2
+            
+        except Exception as e:
+            print(f"Optimal rank computation failed: {e}")
+            return self.rank_1, self.rank_2
+    
+    def adapt_ranks_if_needed(self) -> bool:
+        """
+        Adapt Tucker ranks based on current adapter performance.
+        
+        Returns:
+            True if ranks were adjusted, False otherwise
+        """
+        if not self.dynamic_rank or len(self.active_edges) < 2:
+            return False
+        
+        # Only adjust every N updates to avoid frequent recomputation
+        if len(self.adaptation_history) % self.rank_adjustment_interval != 0:
+            return False
+        
+        # Collect current adapters
+        current_adapters = []
+        for edge in self.active_edges:
+            adapter = self.get_edge_adapter(edge)
+            current_adapters.append(adapter)
+        
+        # Compute current variance explained
+        var_1, var_2 = self._compute_adapter_variance_explained(current_adapters)
+        
+        # If variance is below target, consider increasing ranks
+        # If variance is much above target, consider decreasing ranks
+        needs_adjustment = False
+        new_rank_1, new_rank_2 = self.rank_1, self.rank_2
+        
+        if var_1 < self.target_variance_ratio * 0.9:  # 90% of target
+            # Increase rank_1
+            new_rank_1 = min(self.rank_1 + 1, self.max_rank)
+            needs_adjustment = True
+        elif var_1 > self.target_variance_ratio * 1.1 and self.rank_1 > self.min_rank:  # 110% of target
+            # Decrease rank_1
+            new_rank_1 = max(self.rank_1 - 1, self.min_rank)
+            needs_adjustment = True
+            
+        if var_2 < self.target_variance_ratio * 0.9:
+            new_rank_2 = min(self.rank_2 + 1, self.max_rank)
+            needs_adjustment = True
+        elif var_2 > self.target_variance_ratio * 1.1 and self.rank_2 > self.min_rank:
+            new_rank_2 = max(self.rank_2 - 1, self.min_rank)
+            needs_adjustment = True
+        
+        if needs_adjustment:
+            self._resize_tucker_tensors(new_rank_1, new_rank_2)
+            return True
+        
+        return False
+    
+    def _resize_tucker_tensors(self, new_rank_1: int, new_rank_2: int):
+        """
+        Resize Tucker tensors to new ranks while preserving learned information.
+        """
+        old_rank_1, old_rank_2 = self.rank_1, self.rank_2
+        
+        with torch.no_grad():
+            # Resize core tensor
+            new_core = torch.randn(
+                new_rank_1, new_rank_2, self.adapter_dim, self.base_model_dim,
+                device=self.core_tensor.device,
+                dtype=self.core_tensor.dtype
+            )
+            
+            # Copy over existing values
+            copy_rank_1 = min(old_rank_1, new_rank_1)
+            copy_rank_2 = min(old_rank_2, new_rank_2)
+            new_core[:copy_rank_1, :copy_rank_2] = self.core_tensor[:copy_rank_1, :copy_rank_2]
+            
+            # Resize factor matrices
+            new_factor_u1 = torch.randn(
+                self.max_edges, new_rank_1,
+                device=self.factor_u1.device,
+                dtype=self.factor_u1.dtype
+            )
+            new_factor_u2 = torch.randn(
+                self.max_edges, new_rank_2,
+                device=self.factor_u2.device,
+                dtype=self.factor_u2.dtype
+            )
+            
+            # Copy existing factor values
+            new_factor_u1[:, :copy_rank_1] = self.factor_u1[:, :copy_rank_1]
+            new_factor_u2[:, :copy_rank_2] = self.factor_u2[:, :copy_rank_2]
+            
+            # Initialize new dimensions with small values
+            if new_rank_1 > old_rank_1:
+                nn.init.normal_(new_factor_u1[:, old_rank_1:], 0, 0.01)
+            if new_rank_2 > old_rank_2:
+                nn.init.normal_(new_factor_u2[:, old_rank_2:], 0, 0.01)
+            
+            # Update parameters
+            self.core_tensor = nn.Parameter(new_core)
+            self.factor_u1 = nn.Parameter(new_factor_u1)
+            self.factor_u2 = nn.Parameter(new_factor_u2)
+            
+            self.rank_1 = new_rank_1
+            self.rank_2 = new_rank_2
+            
+        print(f"Adapted Tucker ranks: ({old_rank_1}, {old_rank_2}) -> ({new_rank_1}, {new_rank_2})")
+    
+    def get_rank_statistics(self) -> Dict[str, any]:
+        """
+        Get statistics about current rank usage and adaptation.
+        """
+        if not self.active_edges:
+            return {
+                'current_rank_1': self.rank_1,
+                'current_rank_2': self.rank_2,
+                'variance_explained_1': 0.0,
+                'variance_explained_2': 0.0,
+                'active_edges': 0,
+                'dynamic_rank_enabled': self.dynamic_rank
+            }
+        
+        # Compute current variance explained
+        current_adapters = [self.get_edge_adapter(edge) for edge in self.active_edges]
+        var_1, var_2 = self._compute_adapter_variance_explained(current_adapters)
+        
+        return {
+            'current_rank_1': self.rank_1,
+            'current_rank_2': self.rank_2,
+            'variance_explained_1': var_1,
+            'variance_explained_2': var_2,
+            'target_variance_ratio': self.target_variance_ratio,
+            'active_edges': len(self.active_edges),
+            'dynamic_rank_enabled': self.dynamic_rank,
+            'adaptation_history_length': len(self.adaptation_history)
+        }

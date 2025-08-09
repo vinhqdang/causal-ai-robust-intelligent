@@ -12,6 +12,96 @@ import networkx as nx
 from diffusers import UNet2DModel, DDPMScheduler
 from diffusers.optimization import get_cosine_schedule_with_warmup
 
+# Try to import tiktoken, fallback to GPT-2 BPE if unavailable
+try:
+    import tiktoken
+    TIKTOKEN_AVAILABLE = True
+except ImportError:
+    TIKTOKEN_AVAILABLE = False
+    import warnings
+    warnings.warn("tiktoken not available, falling back to simple tokenization")
+    tiktoken = None
+
+
+class TextTokenizationHandler:
+    """
+    Handles text tokenization with tiktoken fallback to simple BPE.
+    """
+    
+    def __init__(self, model_name: str = "gpt-3.5-turbo", vocab_size: int = 50257):
+        self.vocab_size = vocab_size
+        
+        if TIKTOKEN_AVAILABLE:
+            try:
+                self.encoding = tiktoken.encoding_for_model(model_name)
+                self.tokenizer_type = "tiktoken"
+            except Exception:
+                # Fallback to cl100k_base encoding
+                self.encoding = tiktoken.get_encoding("cl100k_base")
+                self.tokenizer_type = "tiktoken_fallback"
+        else:
+            # Simple fallback tokenizer
+            self.encoding = None
+            self.tokenizer_type = "simple"
+            self._build_simple_vocab()
+    
+    def _build_simple_vocab(self):
+        """Build a simple character-level vocabulary."""
+        # Create basic character vocabulary
+        chars = [chr(i) for i in range(32, 127)]  # Printable ASCII
+        chars += ['\n', '\t', ' ']  # Common whitespace
+        
+        self.char_to_id = {char: i for i, char in enumerate(chars)}
+        self.id_to_char = {i: char for char, i in self.char_to_id.items()}
+        self.vocab_size = len(chars)
+    
+    def encode(self, text: str, max_length: int = 512) -> List[int]:
+        """
+        Encode text to token IDs.
+        
+        Args:
+            text: Input text
+            max_length: Maximum sequence length
+            
+        Returns:
+            token_ids: List of token IDs
+        """
+        if self.tokenizer_type.startswith("tiktoken"):
+            token_ids = self.encoding.encode(text)
+            # Truncate if too long
+            if len(token_ids) > max_length:
+                token_ids = token_ids[:max_length]
+        else:
+            # Simple character-level encoding
+            token_ids = []
+            for char in text[:max_length]:
+                if char in self.char_to_id:
+                    token_ids.append(self.char_to_id[char])
+                else:
+                    token_ids.append(0)  # Unknown character
+        
+        return token_ids
+    
+    def decode(self, token_ids: List[int]) -> str:
+        """
+        Decode token IDs to text.
+        
+        Args:
+            token_ids: List of token IDs
+            
+        Returns:
+            text: Decoded text
+        """
+        if self.tokenizer_type.startswith("tiktoken"):
+            return self.encoding.decode(token_ids)
+        else:
+            # Simple character-level decoding
+            chars = []
+            for token_id in token_ids:
+                if token_id in self.id_to_char:
+                    chars.append(self.id_to_char[token_id])
+            return ''.join(chars)
+
 
 class CausalConditioningModule(nn.Module):
     """
@@ -221,7 +311,12 @@ class GenerativeCounterfactualReplay(nn.Module):
         condition_dim: int = 128,
         num_inference_steps: int = 50,
         learning_rate: float = 1e-4,
-        device: str = "cuda" if torch.cuda.is_available() else "cpu"
+        device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        kl_annealing_schedule: str = "linear",
+        kl_warmup_steps: int = 1000,
+        max_kl_weight: float = 1.0,
+        text_mode: bool = False,
+        vocab_size: int = 50257
     ):
         super().__init__()
         
@@ -230,8 +325,18 @@ class GenerativeCounterfactualReplay(nn.Module):
         self.condition_dim = condition_dim
         self.num_inference_steps = num_inference_steps
         self.device = device
+        self.text_mode = text_mode
+        
+        # KL annealing parameters
+        self.kl_annealing_schedule = kl_annealing_schedule
+        self.kl_warmup_steps = kl_warmup_steps
+        self.max_kl_weight = max_kl_weight
+        self.current_kl_weight = 0.0
         
         channels, height, width = input_shape
+        
+        # Text tokenization handler (with tiktoken fallback)
+        self.text_tokenizer = TextTokenizationHandler(vocab_size=vocab_size) if text_mode else None
         
         # Causal conditioning module
         self.causal_conditioner = CausalConditioningModule(
@@ -427,7 +532,10 @@ class GenerativeCounterfactualReplay(nn.Module):
             noise_pred, noise, causal_graph, interventions
         )
         
-        total_loss = loss + 0.1 * causal_loss
+        # Add curriculum KL regularization loss
+        kl_loss = self._compute_kl_regularization_loss(noise_pred, noise)
+        
+        total_loss = loss + 0.1 * causal_loss + self.current_kl_weight * kl_loss
         
         self.loss_history.append(total_loss.item())
         return total_loss
@@ -487,6 +595,9 @@ class GenerativeCounterfactualReplay(nn.Module):
             optimizer = torch.optim.Adam(self.parameters(), lr=1e-4)
         
         self.train()
+        
+        # Update KL annealing weight
+        self._update_kl_weight()
         
         # Compute loss
         loss = self.compute_generative_cf_loss(data_batch, causal_graph, interventions)
@@ -559,5 +670,111 @@ class GenerativeCounterfactualReplay(nn.Module):
             'trainable_parameters': trainable_params,
             'training_steps': self.training_steps,
             'buffer_size': len(self.cf_buffer),
-            'average_loss': np.mean(self.loss_history[-100:]) if self.loss_history else 0.0
+            'average_loss': np.mean(self.loss_history[-100:]) if self.loss_history else 0.0,
+            'current_kl_weight': self.current_kl_weight,
+            'text_mode': self.text_mode,
+            'tokenizer_type': self.text_tokenizer.tokenizer_type if self.text_tokenizer else None
         }
+    
+    def _update_kl_weight(self):
+        """
+        Update KL annealing weight based on training progress.
+        
+        Implements curriculum KL annealing to stabilize diffusion training.
+        """
+        if self.training_steps < self.kl_warmup_steps:
+            progress = self.training_steps / self.kl_warmup_steps
+            
+            if self.kl_annealing_schedule == "linear":
+                self.current_kl_weight = progress * self.max_kl_weight
+            
+            elif self.kl_annealing_schedule == "cosine":
+                # Cosine annealing schedule
+                self.current_kl_weight = self.max_kl_weight * (1 - np.cos(np.pi * progress)) / 2
+            
+            elif self.kl_annealing_schedule == "exponential":
+                # Exponential warmup
+                self.current_kl_weight = self.max_kl_weight * (1 - np.exp(-5 * progress))
+            
+            elif self.kl_annealing_schedule == "cyclical":
+                # Cyclical annealing with 4 cycles during warmup
+                cycle_progress = (progress * 4) % 1.0
+                self.current_kl_weight = self.max_kl_weight * (1 - np.cos(np.pi * cycle_progress)) / 2
+            
+            else:
+                # Default to linear
+                self.current_kl_weight = progress * self.max_kl_weight
+        else:
+            # After warmup, keep at maximum weight
+            self.current_kl_weight = self.max_kl_weight
+    
+    def _compute_kl_regularization_loss(
+        self,
+        pred_noise: torch.Tensor,
+        true_noise: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute KL regularization loss for curriculum learning.
+        
+        This encourages the model to learn gradually increasing complexity.
+        """
+        batch_size = pred_noise.size(0)
+        
+        # Compute approximate KL divergence between predicted and target distributions
+        # Using Gaussian approximation for simplicity
+        pred_mean = pred_noise.mean(dim=[1, 2, 3])  # [batch_size]
+        pred_std = pred_noise.std(dim=[1, 2, 3]) + 1e-8
+        
+        true_mean = true_noise.mean(dim=[1, 2, 3])
+        true_std = true_noise.std(dim=[1, 2, 3]) + 1e-8
+        
+        # Compute KL divergence between Gaussians
+        kl_div = torch.log(true_std / pred_std) + (pred_std**2 + (pred_mean - true_mean)**2) / (2 * true_std**2) - 0.5
+        
+        return kl_div.mean()
+    
+    def encode_text(self, texts: List[str], max_length: int = 512) -> torch.Tensor:
+        """
+        Encode text inputs for text mode generation.
+        
+        Args:
+            texts: List of text strings
+            max_length: Maximum sequence length
+            
+        Returns:
+            token_ids: Encoded token tensor [batch_size, max_length]
+        """
+        if not self.text_mode or self.text_tokenizer is None:
+            raise ValueError("Text mode not enabled or tokenizer not initialized")
+        
+        batch_tokens = []
+        for text in texts:
+            tokens = self.text_tokenizer.encode(text, max_length)
+            # Pad to max_length
+            if len(tokens) < max_length:
+                tokens.extend([0] * (max_length - len(tokens)))
+            batch_tokens.append(tokens)
+        
+        return torch.tensor(batch_tokens, device=self.device)
+    
+    def decode_text(self, token_ids: torch.Tensor) -> List[str]:
+        """
+        Decode token IDs back to text.
+        
+        Args:
+            token_ids: Token tensor [batch_size, seq_len]
+            
+        Returns:
+            texts: List of decoded text strings
+        """
+        if not self.text_mode or self.text_tokenizer is None:
+            raise ValueError("Text mode not enabled or tokenizer not initialized")
+        
+        texts = []
+        for token_sequence in token_ids.cpu().numpy():
+            # Remove padding tokens (0)
+            valid_tokens = [t for t in token_sequence if t != 0]
+            text = self.text_tokenizer.decode(valid_tokens)
+            texts.append(text)
+        
+        return texts
