@@ -404,7 +404,9 @@ def draw_hexagon(ax, intensity):
 def create_original_images_column(fig, ax_main):
     """Create original images grid"""
     ax_main.axis('off')
-    ax_main.set_title('(b) Original Images', fontsize=14, pad=20)
+    
+    # Add title directly to figure at proper position
+    fig.text(0.5, 0.92, '(b) Original Images', fontsize=14, ha='center', va='center', weight='bold')
     
     # Create 4x4 grid of subplots
     gs = fig.add_gridspec(4, 4, left=0.37, right=0.63, top=0.85, bottom=0.15, 
@@ -426,7 +428,9 @@ def create_original_images_column(fig, ax_main):
 def create_counterfactual_images_column(fig, ax_main):
     """Create counterfactual images grid with clearly visible transformations"""
     ax_main.axis('off')
-    ax_main.set_title('(c) Generated Counterfactuals', fontsize=14, pad=20)
+    
+    # Add title directly to figure at proper position
+    fig.text(0.815, 0.92, '(c) Generated Counterfactuals', fontsize=14, ha='center', va='center', weight='bold')
     
     # Create 4x4 grid of subplots
     gs = fig.add_gridspec(4, 4, left=0.68, right=0.95, top=0.85, bottom=0.15,
@@ -494,7 +498,7 @@ def create_qualitative_analysis_figure():
     # Create main figure
     fig = plt.figure(figsize=(18, 6))
     fig.suptitle('Qualitative Analysis: Counterfactual Generation via Causal Interventions', 
-                fontsize=16, y=0.95)
+                fontsize=16, y=0.98)
     
     # Create three main subplot areas
     ax1 = plt.subplot(131)  # t-SNE
